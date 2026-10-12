@@ -156,80 +156,81 @@ def filters_from_question(q):
 def answer_question(question):
     if not DATA["ready"]:
         raise RuntimeError("Ledger data has not loaded: " + str(DATA["error"]))
+
     q = question.strip()
     low = q.lower()
     rows = filters_from_question(q)
 
-    # Distinguish refunds from revenue. Revenue counts paid orders only.
+    # Determine the population first. Revenue and purchases count paid orders only.
     refund_query = any(w in low for w in ("refund", "refunded", "refunds"))
     void_query = "void" in low
     if refund_query:
         chosen = [r for r in rows if str(r.get("status", "")).lower() == "refunded"]
     elif void_query:
         chosen = [r for r in rows if str(r.get("status", "")).lower() == "void"]
-    elif any(w in low for w in ("order count", "number of orders", "how many orders", "count of orders", "number of transactions", "how many transactions")):
+    elif any(w in low for w in ("all orders", "regardless of status", "including unpaid")):
         chosen = rows
     else:
         chosen = [r for r in rows if str(r.get("status", "")).lower() == "paid"]
 
-    if any(w in low for w in ("how many customers", "number of customers", "unique customers", "customer count", "distinct customers")):
-        # "bought" / customer questions about purchases use paid orders only.
-        customer_rows = chosen if not refund_query and not void_query else rows
-        return len({r.get("customer") for r in customer_rows if r.get("customer")})
+    # Handle averages BEFORE any generic total/sum logic.
+    # "On average, how many US dollars is a paid Central order worth?"
+    # means average USD amount per qualifying order, not sum and not average per unit.
+    if any(w in low for w in ("average", "on average", "mean")):
+        amounts = [usd_amount(r) for r in chosen]
+        if not amounts:
+            return 0.0
+        return money(sum(amounts) / len(amounts))
 
-    if any(w in low for w in ("how many", "number of", "count of", "count the")) and not any(w in low for w in ("revenue", "sales", "amount", "value", "total", "refund")):
-        if "product" in low:
-            return len({r.get("product") for r in rows if r.get("product")})
-        if "customer" in low:
-            return len({r.get("customer") for r in rows if r.get("customer")})
-        return len(chosen)
+    if any(w in low for w in ("how many distinct customers", "distinct customers", "unique customers",
+                              "how many customers", "number of customers", "customer count")):
+        return len({r.get("customer") for r in chosen if r.get("customer")})
 
-    if any(w in low for w in ("which product", "top product", "best-selling product", "best selling product", "most popular product", "product generated", "product had the highest", "highest revenue product")):
+    if any(w in low for w in ("which product", "top product", "best-selling product",
+                              "best selling product", "most popular product",
+                              "product generated", "product had the highest",
+                              "highest revenue product")):
+        # Highest-revenue product uses paid order amounts converted to USD.
         totals = {}
         for r in chosen:
             name = r.get("product", "Unknown")
             totals[name] = totals.get(name, 0.0) + usd_amount(r)
-        if not totals:
-            return "No matching data"
-        return max(totals.items(), key=lambda x: x[1])[0]
+        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
 
-    if any(w in low for w in ("which customer", "top customer", "customer with the most", "highest-spending customer", "highest spending customer")):
+    if any(w in low for w in ("most ordered product", "most frequently ordered product",
+                              "product with the most orders")):
+        totals = {}
+        for r in chosen:
+            name = r.get("product", "Unknown")
+            totals[name] = totals.get(name, 0) + 1
+        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
+
+    if any(w in low for w in ("highest-spending customer", "highest spending customer",
+                              "customer with the most", "top customer", "which customer")):
         totals = {}
         for r in chosen:
             name = r.get("customer", "Unknown")
-            if "most orders" in low or "most purchases" in low or "most transactions" in low:
-                totals[name] = totals.get(name, 0) + 1
-            else:
-                totals[name] = totals.get(name, 0.0) + usd_amount(r)
-        if not totals:
-            return "No matching data"
-        return max(totals.items(), key=lambda x: x[1])[0]
+            totals[name] = totals.get(name, 0.0) + usd_amount(r)
+        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
 
-    if any(w in low for w in ("which product", "product with the most orders", "most ordered product", "most frequently ordered product")):
-        totals = {}
-        for r in rows:
-            name = r.get("product", "Unknown")
-            totals[name] = totals.get(name, 0) + 1
-        if not totals:
-            return "No matching data"
-        return max(totals.items(), key=lambda x: x[1])[0]
-
-    if any(w in low for w in ("average", "mean")):
-        amounts = [usd_amount(r) for r in chosen]
-        return money(sum(amounts) / len(amounts)) if amounts else 0.0
-
-    if any(w in low for w in ("how many", "number of", "count of", "count the")) and refund_query:
-        return len(chosen)
-
-    if any(w in low for w in ("quantity", "units sold", "how many units", "total units")):
+    if any(w in low for w in ("how many units", "total units", "units sold", "quantity")):
         return sum(int(r.get("qty", 0) or 0) for r in chosen)
 
-    if any(w in low for w in ("revenue", "sales", "refund", "refunded", "amount", "value", "total", "sum", "usd")):
+    if any(w in low for w in ("how many", "number of", "count of", "count the")):
+        if "order" in low or "transaction" in low:
+            return len(chosen)
+        if "product" in low:
+            return len({r.get("product") for r in chosen if r.get("product")})
+        if "customer" in low:
+            return len({r.get("customer") for r in chosen if r.get("customer")})
+        return len(chosen)
+
+    # Monetary questions: paid orders are revenue; refunds use refunded rows.
+    if any(w in low for w in ("revenue", "sales", "refund", "refunded",
+                              "amount", "value", "total", "sum", "worth", "usd", "dollar")):
         return money(sum(usd_amount(r) for r in chosen))
 
-    # Default to a count when the question explicitly asks for orders, otherwise sum paid revenue.
-    if "order" in low and any(w in low for w in ("how many", "number", "count")):
-        return len(rows)
+    # Conservative default: total USD value of matching paid orders.
     return money(sum(usd_amount(r) for r in chosen))
 
 @app.get("/")
