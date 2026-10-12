@@ -1,289 +1,218 @@
-import os
-import re
-import calendar
-from datetime import datetime, timedelta
+"""Ledger Agent v2.
+Run:  ROOT_URL="<full url>" LLM_KEY=... uvicorn app:app --host 0.0.0.0 --port 8000
+Check http://localhost:8000/debug FIRST: confirm the detected field mapping and rates.
+"""
+import os, re, json, traceback, datetime as dt, collections, urllib.parse, threading
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal, ROUND_HALF_UP
+import httpx
+from fastapi import FastAPI
 
-import requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+ROOT = os.environ["ROOT_URL"]
+BASE = os.environ.get("LLM_BASE", "https://api.openai.com/v1")
+KEY = os.environ.get("LLM_KEY", "")
+MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
+IST = ZoneInfo("Asia/Kolkata")
+http = httpx.Client(timeout=30, follow_redirects=True)
 
-app = FastAPI(title="Acme Appliances Ledger Agent")
+RAW, RATES, ROWS, MAP, NOTES = [], {}, [], {}, []
 
-API_URL = "https://exam.sanand.workers.dev/questionData"
-EMAIL = os.getenv("EXAM_EMAIL", "24f2005619@ds.study.iitm.ac.in")
-QUIZ_SIGN = os.getenv("EXAM_QUIZ_SIGN", "ZRIwO+aVfPd8nxqco0fUps+Z1wEtWTKAdMjkoN1ZFipYfSsGTLYUYVer86zVtT7pS/Yz2G6eLDGk24ZDrH+xSUUH5sdstn2osRweL/nGFDe+gFkijDtkMhp+24iOW3XfVUr+FH3X1DYapA+KUKqPmXkj5KMzB9xtEQSrkUxFnFvM0aN11atV+eMXeO+hJMsy0VlQVkHE366Hbf121lt1+xA8Z2ZBCFje+3z68cdhFzmmChhzURuIZ8AaMLWfl251evL8UdaBEVAZdL2RkvhROb4ADXRDjdfzv+MQ4L9B3DAYdDHXz9xrc5ICYrriFMgj0cz3OGbtDb6ZlCVXlN5lIw==")
-QUESTION_ID = "q-ledger-agent-server"
-TZ = ZoneInfo("Asia/Kolkata")
-DATA = {"orders": [], "rates": {"USD": 1.0}, "ready": False, "error": None}
 
-def api_get(path, **extra):
-    params = {"email": EMAIL, "quizSign": QUIZ_SIGN, "questionId": QUESTION_ID, "path": path}
-    params.update(extra)
-    response = requests.get(API_URL, params=params, timeout=25)
-    response.raise_for_status()
-    return response.json()
+def setp(url, **kw):
+    p = urllib.parse.urlparse(url)
+    q = dict(urllib.parse.parse_qsl(p.query)); q.update({k: str(v) for k, v in kw.items()})
+    return p._replace(query=urllib.parse.urlencode(q)).geturl()
 
-def parse_dt(value):
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    except Exception:
-        return None
 
-def timestamp(row):
-    dt = parse_dt(row.get("updated_at"))
-    return dt.timestamp() if dt else 0
+def items_of(d):
+    if isinstance(d, list): return d
+    for k in ("data", "items", "orders", "results", "records"):
+        if isinstance(d.get(k), list): return d[k]
+    return next((v for v in d.values() if isinstance(v, list)), [])
 
-def load_data():
-    try:
-        rate_obj = api_get("/rates")
-        rates = rate_obj.get("usd_per_unit") or rate_obj.get("rates") or {"USD": 1.0}
-        first = api_get("/orders", page=1)
-        pages = int(first.get("pages", 1))
-        rows = list(first.get("orders", []))
-        def fetch(page):
-            return api_get("/orders", page=page).get("orders", [])
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            futures = [pool.submit(fetch, p) for p in range(2, pages + 1)]
-            for future in as_completed(futures):
-                rows.extend(future.result())
-        # One current row per order id, using latest updated_at as the API instructs.
-        current = {}
-        for row in rows:
-            oid = str(row.get("id", row.get("order_id", "")))
-            if oid not in current or timestamp(row) > timestamp(current[oid]):
-                current[oid] = row
-        DATA.update(orders=list(current.values()), rates=rates, ready=True, error=None)
-    except Exception as exc:
-        DATA.update(ready=False, error=str(exc))
 
-@app.on_event("startup")
-def startup():
-    load_data()
+def load():
+    global RATES
+    root = http.get(ROOT).json()
+    NOTES[:] = root.get("notes", [])
+    links = root["links"]
+    # orders, all pages
+    page, seen_first = 1, None
+    while page <= 500:
+        d = http.get(setp(links["orders"], page=page)).json()
+        its = items_of(d)
+        if not its: break
+        sig = json.dumps(its[0], sort_keys=True)
+        if sig == seen_first: break          # server ignoring page param
+        if page == 1: seen_first = sig
+        RAW.extend(its)
+        tp = d.get("total_pages") or d.get("pages") if isinstance(d, dict) else None
+        if tp and page >= int(tp): break
+        page += 1
+    RATES = http.get(links["rates"]).json()
+    build()
 
-class Question(BaseModel):
-    question: str
 
-MONTHS = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
-MONTHS.update({name.lower(): i for i, name in enumerate(calendar.month_abbr) if name})
-
-def usd(row):
-    amount = float(row.get("amount", row.get("total", 0)) or 0)
-    currency = str(row.get("currency", "USD")).upper()
-    rates = DATA["rates"]
-    rate = rates.get(currency)
-    if rate is None:
-        rate = next((v for k, v in rates.items() if str(k).upper() == currency), None)
-    if rate is None:
-        if currency == "USD":
-            rate = 1
-        else:
-            raise ValueError("Missing USD conversion rate for " + currency)
-    return amount * float(rate)
-
-def money_round(value):
-    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-def values(field):
-    return sorted({str(r.get(field)) for r in DATA["orders"] if r.get(field) is not None}, key=len, reverse=True)
-
-def extract_filters(question):
-    q = question.lower()
-    year_match = re.search(r"\b(20\d{2})\b", q)
-    year = int(year_match.group(1)) if year_match else None
-    month = None
-    for name, number in sorted(MONTHS.items(), key=lambda item: -len(item[0])):
-        if re.search(r"\b" + re.escape(name) + r"\b", q):
-            month = number
-            break
-    region = next((v for v in values("region") if re.search(r"\b" + re.escape(v.lower()) + r"\b", q)), None)
-    product = next((v for v in values("product") if re.search(r"\b" + re.escape(v.lower()) + r"\b", q)), None)
-    customer = next((v for v in values("customer") if re.search(r"\b" + re.escape(v.lower()) + r"\b", question, re.I)), None)
-    return year, month, region, product, customer
-
-def date_range(question):
-    q = question.lower()
-    year, month, _, _, _ = extract_filters(question)
-    # Explicit quarters
-    quarter = re.search(r"\b(?:q|quarter)\s*([1-4])\b|\b([1-4])(?:st|nd|rd|th)?\s+quarter\b", q)
-    if quarter and year:
-        qn = int(quarter.group(1) or quarter.group(2))
-        start_month = 1 + 3 * (qn - 1)
-        start = datetime(year, start_month, 1, tzinfo=TZ)
-        end = datetime(year + (start_month + 2)//12, ((start_month + 2) % 12) + 1, 1, tzinfo=TZ)
-        return start, end
-    if month and year:
-        start = datetime(year, month, 1, tzinfo=TZ)
-        end = datetime(year + (month == 12), (month % 12) + 1, 1, tzinfo=TZ)
-        return start, end
-    if year:
-        return datetime(year, 1, 1, tzinfo=TZ), datetime(year + 1, 1, 1, tzinfo=TZ)
-    return None, None
-
-def filtered_orders(question):
-    q = question.lower()
-    year, month, region, product, customer = extract_filters(question)
-    # Unless explicitly asking for another status or all statuses, use paid orders.
-    if re.search(r"\b(refund|refunded|refunds)\b", q):
-        statuses = {"refunded"}
-    elif re.search(r"\bvoid(ed)?\b", q):
-        statuses = {"void"}
-    elif re.search(r"\b(unpaid|pending)\b", q):
-        statuses = {"unpaid", "pending"}
-    elif re.search(r"\b(all statuses|all orders|regardless of status|including unpaid|any status)\b", q):
-        statuses = None
-    else:
-        statuses = {"paid"}
-
-    start, end = date_range(question)
-    result = []
-    for row in DATA["orders"]:
-        status = str(row.get("status", "")).lower()
-        if statuses is not None and status not in statuses:
-            continue
-        if region and str(row.get("region", "")).lower() != region.lower():
-            continue
-        if product and str(row.get("product", "")).lower() != product.lower():
-            continue
-        if customer and str(row.get("customer", "")).lower() != customer.lower():
-            continue
-        if start or end:
-            dt = parse_dt(row.get("created_at") or row.get("date") or row.get("order_date"))
-            if not dt or (start and dt < start) or (end and dt >= end):
-                continue
-        result.append(row)
-    return result
-
-def asks_distinct_customers(q):
-    return (
-        bool(re.search(r"\b(distinct|unique|different|individual)\s+customers?\b", q))
-        or bool(re.search(r"\bhow many customers\b", q))
-        or bool(re.search(r"\bnumber of customers\b", q))
-        or bool(re.search(r"\bcustomer count\b", q))
-        or bool(re.search(r"\bcustomers?\b.*\b(at least one|one or more|any)\b", q))
-        or bool(re.search(r"\bhow many different customers\b", q))
-    )
-
-def asks_distinct_products(q):
-    return bool(re.search(r"\b(distinct|unique|different)\s+products?\b", q)) or bool(re.search(r"\bhow many products\b", q))
-
-def asks_average(q):
-    return bool(re.search(r"\b(average|avg|mean|on average)\b", q))
-
-def asks_units(q):
-    return bool(re.search(r"\b(units?|quantity|quantities)\b", q))
-
-def asks_money(q):
-    return bool(re.search(r"\b(revenue|sales|amount|value|total|sum|usd|dollars?|worth|money|refund amount)\b", q))
-
-def asks_count(q):
-    return bool(re.search(r"\b(how many|number of|count|counted)\b", q))
-
-def group_dimension(q):
-    # Prefer the entity explicitly being ranked; avoid treating "customers who bought a product"
-    # as a request to group by customer unless ranking language is present.
-    if re.search(r"\b(per customer|by customer|customer with|customer generated|customer spent|customer revenue|top customer|highest spending customer|best customer)\b", q):
-        return "customer"
-    if re.search(r"\b(per product|by product|top product|which product|what product|best-selling product|best selling product|product with|highest revenue product|top-selling product|top selling product)\b", q):
-        return "product"
-    if re.search(r"\b(per region|by region|top region|which region|what region|region with|highest revenue region)\b", q):
-        return "region"
-    if re.search(r"\b(by month|per month|monthly|month with|which month|top month)\b", q):
-        return "month"
+def first(keys, row):
+    low = {k.lower(): k for k in row}
+    for k in keys:
+        if k in low: return low[k]
     return None
 
-def ranking_requested(q):
-    return bool(re.search(r"\b(top|highest|lowest|best|worst|most|least|largest|smallest|greatest|maximum|minimum|ranked|leading)\b", q))
 
-def bucket_value(row, dimension):
-    if dimension == "month":
-        dt = parse_dt(row.get("created_at") or row.get("date") or row.get("order_date"))
-        return dt.strftime("%B %Y") if dt else None
-    return row.get(dimension)
+def parse_dt(v):
+    if v is None: return None
+    if isinstance(v, (int, float)):
+        return dt.datetime.fromtimestamp(v / (1000 if v > 1e11 else 1), tz=dt.timezone.utc).astimezone(IST)
+    s = str(v).replace("Z", "+00:00")
+    try:
+        d = dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(IST)
 
-def answer_question(question):
-    if not DATA["ready"]:
-        raise RuntimeError("Ledger data failed to load: " + str(DATA["error"]))
-    q = question.lower()
-    rows = filtered_orders(question)
 
-    # Counts of entities must be evaluated before generic "how many orders" logic.
-    if asks_distinct_customers(q):
-        return len({str(r.get("customer")) for r in rows if r.get("customer") not in (None, "")})
-    if asks_distinct_products(q):
-        return len({str(r.get("product")) for r in rows if r.get("product") not in (None, "")})
+def rate_for(cur, when):
+    """Return multiplier converting 1 unit of `cur` into USD."""
+    if not cur or cur.upper() == "USD": return 1.0
+    cur = cur.upper()
+    r = RATES
+    base = (r.get("base") or r.get("base_currency") or "USD") if isinstance(r, dict) else "USD"
+    table = None
+    if isinstance(r, dict):
+        for k in ("rates", "data", "usd_rates", "to_usd"):
+            if isinstance(r.get(k), (dict, list)): table = r[k]; break
+        if table is None: table = {k: v for k, v in r.items() if isinstance(v, (int, float))}
+    else:
+        table = r
+    val = None
+    if isinstance(table, dict):
+        v = table.get(cur)
+        if isinstance(v, dict):                 # dated: {"EUR": {"2026-03-01": 1.08}}
+            ks = sorted(v); day = when.strftime("%Y-%m-%d") if when else ks[-1]
+            val = v.get(day) or v[max([k for k in ks if k <= day] or [ks[0]])]
+        else: val = v
+    elif isinstance(table, list):
+        rows = [x for x in table if str(x.get("currency", x.get("code", ""))).upper() == cur]
+        dk = next((k for k in ("date", "effective_date", "as_of", "valid_from") if rows and k in rows[0]), None)
+        if rows:
+            if dk and when:
+                day = when.strftime("%Y-%m-%d")
+                ok = [x for x in rows if str(x[dk])[:10] <= day] or rows
+                x = max(ok, key=lambda x: str(x[dk]))
+            else: x = rows[-1]
+            val = x.get("rate", x.get("usd_rate", x.get("to_usd")))
+    if val is None: return 1.0
+    val = float(val)
+    rate_key_hint = json.dumps(r)[:600].lower()
+    per_usd = base.upper() == "USD" and "to_usd" not in rate_key_hint and "usd_per" not in rate_key_hint
+    return (1.0 / val) if per_usd else val
 
-    # Ranking questions: e.g. top product by revenue, most units by product, highest-revenue region.
-    dimension = group_dimension(q)
-    if dimension and ranking_requested(q):
-        buckets = {}
-        for row in rows:
-            key = bucket_value(row, dimension)
-            if key in (None, ""):
-                continue
-            if asks_units(q):
-                metric = float(row.get("qty", row.get("quantity", 0)) or 0)
-            elif asks_count(q) and not asks_money(q):
-                metric = 1
-            else:
-                metric = usd(row)
-            buckets[str(key)] = buckets.get(str(key), 0) + metric
-        if not buckets:
-            return "No matching data"
-        reverse = not bool(re.search(r"\b(lowest|least|smallest|minimum|worst)\b", q))
-        return sorted(buckets.items(), key=lambda item: (item[1], item[0]), reverse=reverse)[0][0]
 
-    if asks_average(q):
-        if not rows:
-            return 0.0
-        if asks_units(q):
-            return money_round(sum(float(r.get("qty", r.get("quantity", 0)) or 0) for r in rows) / len(rows))
-        return money_round(sum(usd(r) for r in rows) / len(rows))
+def build():
+    if not RAW: return
+    s = RAW[0]
+    MAP.update({
+        "id": first(["order_id", "id", "orderid"], s),
+        "updated": first(["updated_at", "updatedat", "modified_at"], s),
+        "created": first(["created_at", "order_date", "ordered_at", "placed_at", "date", "createdat", "timestamp"], s),
+        "status": first(["status", "order_status", "state"], s),
+        "amount": first(["amount_usd", "amount", "total", "total_amount", "price", "revenue", "amount_cents", "total_cents"], s),
+        "currency": first(["currency", "currency_code"], s),
+        "region": first(["region", "sales_region"], s),
+        "product": first(["product", "product_name", "item", "sku_name"], s),
+        "customer": first(["customer_id", "customer", "customer_email", "customer_name", "email"], s),
+        "refund": next((k for k in s if "refund" in k.lower() and ("amount" in k.lower() or "cent" in k.lower())), None),
+    })
+    m = MAP
+    latest = {}
+    for r in RAW:
+        k = r.get(m["id"])
+        u = r.get(m["updated"]) if m["updated"] else ""
+        if k not in latest or str(u) >= str(latest[k].get(m["updated"], "")):
+            latest[k] = r
+    ROWS.clear()
+    for r in latest.values():
+        when = parse_dt(r.get(m["created"]))
+        def money(key):
+            if not key or r.get(key) is None: return None
+            v = float(r[key]) / (100 if "cent" in key.lower() else 1)
+            if m["currency"] and "usd" not in key.lower():
+                v *= rate_for(r.get(m["currency"]), when)
+            return v
+        norm = lambda x: re.sub(r"\s+", " ", str(x)).strip() if x is not None else None
+        ROWS.append({
+            "id": r.get(m["id"]), "status": (norm(r.get(m["status"])) or "").lower(),
+            "region": norm(r.get(m["region"])), "product": norm(r.get(m["product"])),
+            "customer": (norm(r.get(m["customer"])) or "").lower(),
+            "usd": money(m["amount"]), "refund_usd": money(m["refund"]),
+            "when": when, "year": when.year if when else None, "month": when.month if when else None,
+            "raw": r,
+        })
 
-    if asks_units(q):
-        return sum(float(r.get("qty", r.get("quantity", 0)) or 0) for r in rows)
 
-    if asks_count(q):
-        # "how many orders/transactions" means row/order count; data has been deduplicated by order id.
-        if re.search(r"\b(order|orders|transaction|transactions)\b", q):
-            return len(rows)
-        if re.search(r"\b(customer|customers)\b", q):
-            return len({str(r.get("customer")) for r in rows if r.get("customer") not in (None, "")})
-        if re.search(r"\b(product|products)\b", q):
-            return len({str(r.get("product")) for r in rows if r.get("product") not in (None, "")})
-        return len(rows)
+SYSTEM = """You answer questions about an order ledger by writing Python.
+`rows` = list of CLEAN dicts (already deduplicated to the latest version per order, money converted to USD floats, dates in IST):
+id, status (lowercase), region, product, customer, usd (order amount in USD), refund_usd (or None), when (tz-aware datetime in IST),
+year, month, raw (original record). Rules: revenue/sales/spend counts ONLY status=='paid' unless the question is about refunds/other statuses.
+Region/product/customer matching: case-insensitive. Product names in answers must be spelled exactly as in `rows`.
+Write ONLY the source of `def solve(rows):` returning: a number (money rounded to 2 decimals, counts as int),
+or a string (e.g. product name for 'top-selling product'), or a list/dict if explicitly asked for several things.
+'Top product by revenue' -> return the product NAME. Averages: sum/count unrounded then round(,2). No prints, no markdown."""
 
-    if asks_money(q):
-        return money_round(sum(usd(r) for r in rows))
 
-    # Questions phrased as "which/what product ... generated the most revenue"
-    if re.search(r"\b(which|what)\s+products?\b", q):
-        totals = {}
-        for row in rows:
-            name = str(row.get("product", ""))
-            totals[name] = totals.get(name, 0) + usd(row)
-        return max(totals.items(), key=lambda item: item[1])[0] if totals else "No matching data"
+def ctx():
+    c = lambda f: dict(collections.Counter(r[f] for r in ROWS).most_common(30))
+    return (f"NOTES: {NOTES}\nMAPPING: {MAP}\nSTATUSES: {c('status')}\nREGIONS: {c('region')}\nPRODUCTS: {c('product')}\n"
+            f"N_ROWS: {len(ROWS)}\nSAMPLE: {[{k: str(v) for k, v in r.items() if k != 'raw'} for r in ROWS[:2]]}\n"
+            f"RAW SAMPLE: {json.dumps(RAW[0])[:600]}")
 
-    return money_round(sum(usd(r) for r in rows))
 
-@app.get("/")
-def health():
-    return {"service": "Acme Appliances Ledger Agent", "ready": DATA["ready"],
-            "orders_loaded": len(DATA["orders"]), "health": "ok" if DATA["ready"] else "error",
-            "error": DATA["error"]}
+def ask_llm(q, err=None):
+    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": f"{ctx()}\n\nQUESTION: {q}"}]
+    if err: msgs.append({"role": "user", "content": f"Your code failed:\n{err}\nFix it."})
+    r = httpx.post(f"{BASE}/chat/completions", timeout=10, headers={"Authorization": f"Bearer {KEY}"},
+                   json={"model": MODEL, "messages": msgs, "temperature": 0})
+    code = r.json()["choices"][0]["message"]["content"]
+    return re.sub(r"^```(?:python)?\s*|```\s*$", "", code.strip(), flags=re.M).strip()
+
+
+def answer(q):
+    err = None
+    for _ in range(2):
+        try:
+            env = {"datetime": dt, "collections": collections, "re": re}
+            exec(ask_llm(q, err), env)
+            a = env["solve"](ROWS)
+            if isinstance(a, float):
+                a = round(a, 2)
+                if a == int(a) and abs(a) < 1e12 and "." not in str(a).rstrip("0"): pass
+            return a
+        except Exception:
+            err = traceback.format_exc()[-600:]
+    return None
+
+
+app = FastAPI()
+ready = threading.Event()
+
+
+def boot():
+    try: load()
+    finally: ready.set()
+
+
+threading.Thread(target=boot, daemon=True).start()
+
 
 @app.post("/")
-def ask(body: Question):
-    if not body.question.strip():
-        raise HTTPException(status_code=400, detail="question must not be empty")
-    try:
-        return {"answer": answer_question(body.question)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def ask(body: dict):
+    ready.wait(12)
+    return {"answer": answer(body.get("question", ""))}
+
+
+@app.get("/debug")
+def debug():
+    return {"mapping": MAP, "notes": NOTES, "n_raw": len(RAW), "n_clean": len(ROWS),
+            "rates": RATES, "sample": [{k: str(v) for k, v in r.items() if k != "raw"} for r in ROWS[:3]],
+            "raw_sample": RAW[:2]}
