@@ -1,7 +1,7 @@
 import os
 import re
 import calendar
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP
@@ -20,61 +20,61 @@ QUIZ_SIGN = os.getenv(
 )
 QUESTION_ID = "q-ledger-agent-server"
 TZ = ZoneInfo("Asia/Kolkata")
+
 DATA = {"orders": [], "rates": {"USD": 1.0}, "ready": False, "error": None}
 
 def api_get(path, **extra):
-    params = {
-        "email": EMAIL,
-        "quizSign": QUIZ_SIGN,
-        "questionId": QUESTION_ID,
-        "path": path,
-    }
+    params = {"email": EMAIL, "quizSign": QUIZ_SIGN,
+              "questionId": QUESTION_ID, "path": path}
     params.update(extra)
     r = requests.get(API_URL, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
+def parse_dt(raw):
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    except Exception:
+        return None
+
+def updated_ts(row):
+    dt = parse_dt(row.get("updated_at"))
+    return dt.timestamp() if dt else 0
+
 def load_data():
     try:
         rates_obj = api_get("/rates")
-        rates = rates_obj.get("usd_per_unit", {"USD": 1.0})
+        rates = rates_obj.get("usd_per_unit") or rates_obj.get("rates") or {"USD": 1.0}
         first = api_get("/orders", page=1)
         pages = int(first.get("pages", 1))
         rows = list(first.get("orders", []))
 
-        def fetch_page(page):
-            result = api_get("/orders", page=page)
-            return result.get("orders", [])
+        def fetch(p):
+            return api_get("/orders", page=p).get("orders", [])
 
-        # Fetch pages concurrently so startup finishes quickly.
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            futures = [pool.submit(fetch_page, p) for p in range(2, pages + 1)]
-            for future in as_completed(futures):
-                rows.extend(future.result())
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            fs = [pool.submit(fetch, p) for p in range(2, pages + 1)]
+            for f in as_completed(fs):
+                rows.extend(f.result())
 
-        # The ledger can repeat IDs. Keep the row with the latest updated_at.
+        # Current order = latest updated_at for duplicate order IDs.
         current = {}
-        def updated_key(row):
-            raw = row.get("updated_at", "")
-            try:
-                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-                return dt.timestamp()
-            except Exception:
-                return 0.0
-        for row in rows:
-            oid = str(row.get("id", ""))
-            old = current.get(oid)
-            if old is None or updated_key(row) > updated_key(old):
-                current[oid] = row
+        for r in rows:
+            oid = str(r.get("id", r.get("order_id", "")))
+            if oid not in current or updated_ts(r) > updated_ts(current[oid]):
+                current[oid] = r
 
         DATA["orders"] = list(current.values())
         DATA["rates"] = rates
         DATA["ready"] = True
         DATA["error"] = None
-    except Exception as exc:
-        DATA["error"] = str(exc)
+    except Exception as e:
+        DATA["error"] = str(e)
         DATA["ready"] = False
 
 @app.on_event("startup")
@@ -87,171 +87,196 @@ class Question(BaseModel):
 MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
 
-def money(value):
-    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+def usd(r):
+    amount = float(r.get("amount", r.get("total", 0)) or 0)
+    cur = str(r.get("currency", "USD")).upper()
+    rates = DATA["rates"]
+    rate = rates.get(cur)
+    if rate is None:
+        # Some APIs return currency codes with lower-case keys.
+        rate = next((v for k, v in rates.items() if str(k).upper() == cur), None)
+    if rate is None:
+        if cur == "USD":
+            rate = 1
+        else:
+            raise ValueError("No USD exchange rate for " + cur)
+    return amount * float(rate)
 
-def order_date(row):
-    raw = row.get("created_at") or row.get("updated_at")
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    except Exception:
-        return None
+def all_values(field):
+    return sorted({str(r.get(field)) for r in DATA["orders"] if r.get(field) is not None}, key=len, reverse=True)
 
-def usd_amount(row):
-    amount = float(row.get("amount", 0) or 0)
-    currency = str(row.get("currency", "USD")).upper()
-    rate = float(DATA["rates"].get(currency, 0) or 0)
-    return amount * rate
-
-def filters_from_question(q):
+def extract_filters(q):
     low = q.lower()
-    year_match = re.search(r"\b(20\d{2})\b", low)
-    year = int(year_match.group(1)) if year_match else None
+    year_m = re.search(r"\b(20\d{2})\b", low)
+    year = int(year_m.group(1)) if year_m else None
+
     month = None
-    for name, number in sorted(MONTHS.items(), key=lambda x: -len(x[0])):
+    for name, num in sorted(MONTHS.items(), key=lambda x: -len(x[0])):
         if re.search(r"\b" + re.escape(name) + r"\b", low):
-            month = number
+            month = num
             break
 
-    region = None
-    for name in ("north", "south", "east", "west", "central"):
-        if re.search(r"\b" + name + r"\b", low):
-            region = name.title()
-            break
+    # If a year/month is mentioned, use the order's business date (created_at).
+    regions = all_values("region")
+    region = next((x for x in regions if re.search(r"\b"+re.escape(x.lower())+r"\b", low)), None)
 
-    products = sorted({str(o.get("product", "")) for o in DATA["orders"] if o.get("product")}, key=len, reverse=True)
-    product = next((p for p in products if p.lower() in low), None)
+    products = all_values("product")
+    product = next((x for x in products if x.lower() in low), None)
 
-    customer_match = re.search(r"\bC\d{4}\b", q, re.I)
-    customer = customer_match.group(0).upper() if customer_match else None
+    customers = all_values("customer")
+    customer = next((x for x in customers if re.search(r"\b"+re.escape(x.lower())+r"\b", q, re.I)), None)
 
-    def date_filter(row):
-        dt = order_date(row)
-        if not dt:
-            return False
-        if year is not None and dt.year != year:
-            return False
-        if month is not None and dt.month != month:
-            return False
-        return True
+    return year, month, region, product, customer
 
-    filtered = []
-    for row in DATA["orders"]:
-        if region and str(row.get("region", "")).lower() != region.lower():
-            continue
-        if product and str(row.get("product", "")).lower() != product.lower():
-            continue
-        if customer and str(row.get("customer", "")).upper() != customer:
-            continue
-        if (year is not None or month is not None) and not date_filter(row):
-            continue
-        filtered.append(row)
-    return filtered
-
-def answer_question(question):
-    if not DATA["ready"]:
-        raise RuntimeError("Ledger data has not loaded: " + str(DATA["error"]))
-
-    q = question.strip()
+def filtered_orders(q):
     low = q.lower()
-    rows = filters_from_question(q)
+    year, month, region, product, customer = extract_filters(q)
 
-    # Determine the population first. Revenue and purchases count paid orders only.
-    refund_query = any(w in low for w in ("refund", "refunded", "refunds"))
-    void_query = "void" in low
-    if refund_query:
-        chosen = [r for r in rows if str(r.get("status", "")).lower() == "refunded"]
-    elif void_query:
-        chosen = [r for r in rows if str(r.get("status", "")).lower() == "void"]
-    elif any(w in low for w in ("all orders", "regardless of status", "including unpaid")):
-        chosen = rows
+    # Status semantics.
+    if any(x in low for x in ("refund", "refunded", "refunds")):
+        statuses = {"refunded"}
+    elif "void" in low:
+        statuses = {"void"}
+    elif any(x in low for x in ("unpaid", "pending")):
+        statuses = {"unpaid", "pending"}
     else:
-        chosen = [r for r in rows if str(r.get("status", "")).lower() == "paid"]
+        # Revenue, sales, purchases and "bought" mean paid unless explicitly all orders.
+        statuses = None if any(x in low for x in ("all orders", "regardless of status", "all statuses")) else {"paid"}
 
-    # Handle averages BEFORE any generic total/sum logic.
-    # "On average, how many US dollars is a paid Central order worth?"
-    # means average USD amount per qualifying order, not sum and not average per unit.
-    if any(w in low for w in ("average", "on average", "mean")):
-        amounts = [usd_amount(r) for r in chosen]
-        if not amounts:
+    out = []
+    for r in DATA["orders"]:
+        status = str(r.get("status", "")).lower()
+        if statuses is not None and status not in statuses:
+            continue
+        if region and str(r.get("region", "")).lower() != region.lower():
+            continue
+        if product and str(r.get("product", "")).lower() != product.lower():
+            continue
+        if customer and str(r.get("customer", "")).lower() != customer.lower():
+            continue
+
+        if year is not None or month is not None:
+            dt = parse_dt(r.get("created_at") or r.get("date") or r.get("updated_at"))
+            if not dt:
+                continue
+            if year is not None and dt.year != year:
+                continue
+            if month is not None and dt.month != month:
+                continue
+        out.append(r)
+    return out
+
+def round2(x):
+    return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+def wants_count(low):
+    return bool(re.search(r"\b(how many|number of|count|counted|distinct|unique)\b", low))
+
+def is_average(low):
+    return bool(re.search(r"\b(average|avg|mean|on average)\b", low))
+
+def group_dimension(low):
+    # Most-specific grouping requested by the question.
+    if "customer" in low:
+        return "customer"
+    if "product" in low:
+        return "product"
+    if "region" in low:
+        return "region"
+    if "month" in low or "monthly" in low:
+        return "month"
+    return None
+
+def answer_question(q):
+    if not DATA["ready"]:
+        raise RuntimeError("Ledger data is not ready: " + str(DATA["error"]))
+
+    low = q.lower()
+    rows = filtered_orders(q)
+
+    # Explicit distinct customer count.
+    if ("distinct customer" in low or "unique customer" in low or
+        ("how many customers" in low and not ("per customer" in low))):
+        return len({r.get("customer") for r in rows if r.get("customer")})
+
+    # Explicit distinct product count.
+    if ("distinct product" in low or "unique product" in low):
+        return len({r.get("product") for r in rows if r.get("product")})
+
+    # Average order value. Do this before totals.
+    if is_average(low):
+        if not rows:
             return 0.0
-        return money(sum(amounts) / len(amounts))
+        return round2(sum(usd(r) for r in rows) / len(rows))
 
-    if any(w in low for w in ("how many distinct customers", "distinct customers", "unique customers",
-                              "how many customers", "number of customers", "customer count")):
-        return len({r.get("customer") for r in chosen if r.get("customer")})
+    # Quantity / units.
+    if any(x in low for x in ("units sold", "total units", "how many units", "quantity")):
+        return sum(int(r.get("qty", r.get("quantity", 0)) or 0) for r in rows)
 
-    if any(w in low for w in ("which product", "top product", "best-selling product",
-                              "best selling product", "most popular product",
-                              "product generated", "product had the highest",
-                              "highest revenue product")):
-        # Highest-revenue product uses paid order amounts converted to USD.
-        totals = {}
-        for r in chosen:
-            name = r.get("product", "Unknown")
-            totals[name] = totals.get(name, 0.0) + usd_amount(r)
-        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
+    # Grouped "top/best/highest/lowest" questions.
+    top = any(x in low for x in ("top ", "highest", "best-selling", "best selling",
+                                 "most ", "largest", "greatest", "maximum"))
+    bottom = any(x in low for x in ("lowest", "least", "smallest", "minimum"))
+    group = group_dimension(low)
 
-    if any(w in low for w in ("most ordered product", "most frequently ordered product",
-                              "product with the most orders")):
-        totals = {}
-        for r in chosen:
-            name = r.get("product", "Unknown")
-            totals[name] = totals.get(name, 0) + 1
-        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
+    if group and (top or bottom):
+        metric_is_count = wants_count(low) and not any(x in low for x in ("revenue", "sales", "amount", "usd", "dollar", "value"))
+        buckets = {}
+        for r in rows:
+            key = r.get(group)
+            if key is None:
+                continue
+            if metric_is_count:
+                val = 1
+            elif "unit" in low or "quantity" in low:
+                val = int(r.get("qty", r.get("quantity", 0)) or 0)
+            else:
+                val = usd(r)
+            buckets[str(key)] = buckets.get(str(key), 0) + val
+        if not buckets:
+            return "No matching data"
+        return (max if not bottom else min)(buckets.items(), key=lambda x: x[1])[0]
 
-    if any(w in low for w in ("highest-spending customer", "highest spending customer",
-                              "customer with the most", "top customer", "which customer")):
-        totals = {}
-        for r in chosen:
-            name = r.get("customer", "Unknown")
-            totals[name] = totals.get(name, 0.0) + usd_amount(r)
-        return max(totals.items(), key=lambda x: x[1])[0] if totals else "No matching data"
-
-    if any(w in low for w in ("how many units", "total units", "units sold", "quantity")):
-        return sum(int(r.get("qty", 0) or 0) for r in chosen)
-
-    if any(w in low for w in ("how many", "number of", "count of", "count the")):
+    # Plain count questions.
+    if wants_count(low):
         if "order" in low or "transaction" in low:
-            return len(chosen)
-        if "product" in low:
-            return len({r.get("product") for r in chosen if r.get("product")})
+            return len(rows)
         if "customer" in low:
-            return len({r.get("customer") for r in chosen if r.get("customer")})
-        return len(chosen)
+            return len({r.get("customer") for r in rows if r.get("customer")})
+        if "product" in low:
+            return len({r.get("product") for r in rows if r.get("product")})
+        return len(rows)
 
-    # Monetary questions: paid orders are revenue; refunds use refunded rows.
-    if any(w in low for w in ("revenue", "sales", "refund", "refunded",
-                              "amount", "value", "total", "sum", "worth", "usd", "dollar")):
-        return money(sum(usd_amount(r) for r in chosen))
+    # Total monetary value.
+    if any(x in low for x in ("revenue", "sales", "refund", "refunded",
+                              "amount", "value", "total", "sum", "usd", "dollar", "worth")):
+        return round2(sum(usd(r) for r in rows))
 
-    # Conservative default: total USD value of matching paid orders.
-    return money(sum(usd_amount(r) for r in chosen))
+    # If the question asks "which X" without top language, return the max revenue X.
+    if low.startswith("which product") or low.startswith("what product"):
+        buckets = {}
+        for r in rows:
+            k = str(r.get("product", ""))
+            buckets[k] = buckets.get(k, 0) + usd(r)
+        return max(buckets.items(), key=lambda x:x[1])[0] if buckets else "No matching data"
+
+    return round2(sum(usd(r) for r in rows))
 
 @app.get("/")
-def home():
-    return {
-        "service": "Acme Appliances Ledger Agent",
-        "ready": DATA["ready"],
-        "orders_loaded": len(DATA["orders"]),
-        "health": "ok" if DATA["ready"] else "loading_or_error",
-        "error": DATA["error"],
-        "usage": "POST / with JSON {\"question\": \"...\"}"
-    }
+def root():
+    return {"service":"Acme Appliances Ledger Agent",
+            "ready":DATA["ready"],
+            "orders_loaded":len(DATA["orders"]),
+            "health":"ok" if DATA["ready"] else "error",
+            "error":DATA["error"]}
 
 @app.post("/")
 def ask(body: Question):
     if not body.question.strip():
-        raise HTTPException(status_code=400, detail="question must not be empty")
+        raise HTTPException(400, "question must not be empty")
     try:
         return {"answer": answer_question(body.question)}
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 
