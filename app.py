@@ -172,8 +172,10 @@ def answer_question(question):
     else:
         chosen = [r for r in rows if str(r.get("status", "")).lower() == "paid"]
 
-    if any(w in low for w in ("how many customers", "number of customers", "unique customers", "customer count")):
-        return len({r.get("customer") for r in rows if r.get("customer")})
+    if any(w in low for w in ("how many customers", "number of customers", "unique customers", "customer count", "distinct customers")):
+        # "bought" / customer questions about purchases use paid orders only.
+        customer_rows = chosen if not refund_query and not void_query else rows
+        return len({r.get("customer") for r in customer_rows if r.get("customer")})
 
     if any(w in low for w in ("how many", "number of", "count of", "count the")) and not any(w in low for w in ("revenue", "sales", "amount", "value", "total", "refund")):
         if "product" in low:
@@ -251,3 +253,4 @@ def ask(body: Question):
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
