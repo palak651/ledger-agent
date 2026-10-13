@@ -1,3 +1,4 @@
-fastapi
-uvicorn[standard]
-requests
+
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+requests>=2.31,<3
